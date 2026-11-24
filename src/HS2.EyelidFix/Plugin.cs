@@ -1,22 +1,31 @@
 using System;
 using System.Collections.Generic;
 using AIChara;
+using HarmonyLib;
+using System.Runtime.CompilerServices;
+using System.Threading.Tasks;
 using BepInEx;
 using UnityEngine;
 
-[BepInPlugin("local.hs2.eyelidfix","HS2 Eyelid Fix","1.0.0")]
+[BepInPlugin("local.hs2.eyelidfix","HS2 Eyelid Fix","1.0.1")]
 public sealed class EyelidFix : BaseUnityPlugin
 {
-    float next;
-    void Update()
+    Harmony hooks;
+    void Awake()
     {
-        if(Time.unscaledTime < next) return;
-        next = Time.unscaledTime + 1;
-        foreach(var face in FindObjectsOfType<CmpFace>()) {
-            Attach(face.targetCustom.rendHead);
-            Attach(face.targetCustom.rendEyelashes);
-        }
+        hooks = new Harmony("local.hs2.eyelidfix");
+        hooks.Patch(AccessTools.Method(typeof(ChaControl), "SetFaceBaseMaterial"),
+            postfix: new HarmonyMethod(typeof(EyelidFix), "HeadReady"));
+        foreach (var face in FindObjectsOfType<CmpFace>()) AttachFace(face);
     }
+    static void HeadReady(ChaControl __instance) { AttachFace(__instance.cmpFace); }
+    static void AttachFace(CmpFace face)
+    {
+        if (!face || face.targetCustom == null) return;
+        Attach(face.targetCustom.rendHead);
+        Attach(face.targetCustom.rendEyelashes);
+    }
+    void OnDestroy() { if (hooks != null) hooks.UnpatchSelf(); }
     static void Attach(Renderer renderer) {
             var r = renderer as SkinnedMeshRenderer;
             if(r && !r.GetComponent<EyelidUV>()) r.gameObject.AddComponent<EyelidUV>();
@@ -37,6 +46,16 @@ public sealed class EyelidUV : MonoBehaviour
     readonly int[] shape = new int[names.Length];
     readonly Vector2[][] offset = new Vector2[names.Length][];
     readonly float[] weights = new float[names.Length];
+    sealed class Solutions
+    {
+        public readonly Dictionary<int, Task<Vector2[]>> jobs = new Dictionary<int, Task<Vector2[]>>();
+    }
+    static readonly ConditionalWeakTable<Mesh, Solutions> cache = new ConditionalWeakTable<Mesh, Solutions>();
+    Solutions solutions;
+    readonly int[][] affected = new int[names.Length][];
+    readonly float[] readyAt = new float[names.Length];
+    readonly float[] applied = new float[names.Length];
+    float[] totals;
     Vector3[] vertices;
     int[] triangles;
     bool reportedApplication;
@@ -47,15 +66,16 @@ public sealed class EyelidUV : MonoBehaviour
         if(!mesh || !mesh.isReadable) return;
         bool lash = mesh.GetBlendShapeIndex("lash.e05_damage") >= 0;
         string prefix = lash ? "lash." : "head.";
+        solutions=cache.GetValue(mesh, ignored => new Solutions());
         rest=mesh.uv;
         vertices=mesh.vertices;
         if(rest.Length!=vertices.Length) return;
         triangles=mesh.triangles;
         for(int s=0;s<names.Length;s++) {
             shape[s]=mesh.GetBlendShapeIndex(prefix+names[s]);
-            offset[s]=null; weights[s]=0;
+            offset[s]=null; weights[s]=0; applied[s]=0; affected[s]=null;
         }
-        frame=new Vector2[rest.Length];
+        frame=new Vector2[rest.Length]; totals=new float[rest.Length];
         instance=Instantiate(mesh);
         instance.name=mesh.name;
         Swap(instance);
@@ -69,15 +89,27 @@ public sealed class EyelidUV : MonoBehaviour
         for(int i=0;i<weights.Length;i++) head.SetBlendShapeWeight(i,weights[i]);
     }
     static float Cross(Vector2 a, Vector2 b) { return a.x*b.y-a.y*b.x; }
-    public static Vector2[] Solve(Mesh mesh,int shapeIndex,Vector3[] pos,Vector2[] uv,int[] tri)
+    Task<Vector2[]> Solution(int slot)
     {
-        int n=uv.Length;
-        var shifts=new Vector2[n];
-        if(shapeIndex<0) return shifts;
-        var delta=new Vector3[n];
-        int key=mesh.GetBlendShapeFrameCount(shapeIndex)-1;
-        if(key<0) return shifts;
-        mesh.GetBlendShapeFrameVertices(shapeIndex,key,delta,null,null);
+        int index = shape[slot];
+        Task<Vector2[]> job;
+        if (solutions.jobs.TryGetValue(index, out job)) return job;
+        // Snapshot Unity data on the main thread. The worker only sees arrays.
+        var delta = new Vector3[vertices.Length];
+        int key = source.GetBlendShapeFrameCount(index) - 1;
+        if (key >= 0) source.GetBlendShapeFrameVertices(index, key, delta, null, null);
+        var pos = vertices;
+        var uv = rest;
+        var tri = triangles;
+        bool close = names[slot].Contains("_close");
+        job = Task.Run(() => Solve(pos, uv, tri, delta, close));
+        solutions.jobs.Add(index, job);
+        return job;
+    }
+    static Vector2[] Solve(Vector3[] pos, Vector2[] uv, int[] tri, Vector3[] delta, bool ordinaryClose)
+    {
+        int n = uv.Length;
+        var shifts = new Vector2[n];
         var edgeCounts=new Dictionary<long,int>();
         var border=new bool[n];
         for(int k=0;k<tri.Length;k++) {
@@ -91,7 +123,7 @@ public sealed class EyelidUV : MonoBehaviour
         // Give stretched triangles room to borrow texture area from the
         // adjacent lid surface while keeping the rest of the face fixed.
         var region = new bool[n];
-        bool ordinaryClose = mesh.GetBlendShapeName(shapeIndex).Contains("_close");
+
         for (int v = 0; v < n; v++)
             region[v] = ordinaryClose ? delta[v].y < -.0001f : delta[v].sqrMagnitude > 1e-8f;
         for (int ring = 0; ring < 3; ring++) {
@@ -156,36 +188,55 @@ public sealed class EyelidUV : MonoBehaviour
         }
         if(!instance || head.sharedMesh!=instance) return;
         bool changed=false;
+        float now=Time.realtimeSinceStartup;
         for(int s=0; s<shape.Length; s++) {
             float value=ReadWeight(s);
-            changed |= value!=weights[s];
+
             weights[s]=value;
+        }
+        // Poll only active shapes whose solution has not arrived yet.
+        for (int s=0;s<shape.Length;s++) {
+            if (weights[s]==0 || offset[s]!=null) continue;
+            var job=Solution(s);
+            if (!job.IsCompleted) continue;
+            if (job.IsFaulted) {
+                Debug.LogException(job.Exception);
+                offset[s]=new Vector2[rest.Length];
+            } else offset[s]=job.Result;
+            var indices=new List<int>();
+            for(int v=0;v<rest.Length;v++) if(offset[s][v].sqrMagnitude>=1e-18f) indices.Add(v);
+            affected[s]=indices.ToArray();
+            readyAt[s]=now;
+        }
+        for(int s=0;s<shape.Length;s++) {
+            float w=weights[s];
+            if(s==1 || s==2) w=Mathf.Min(w,1-weights[0]);
+            float next=offset[s]==null ? 0f : w*Mathf.Clamp01((now-readyAt[s])/.06f);
+            changed |= applied[s]!=next;
+            applied[s]=next;
         }
         if(!changed) return;
         // The paired close shapes share one budget per side. Independent
         // expressions only consume budget where their solved offsets overlap.
-        for(int s=0;s<shape.Length;s++)
-            if(weights[s]>0 && offset[s]==null)
-                offset[s]=Solve(source,shape[s],vertices,rest,triangles);
-        Array.Copy(rest,frame,rest.Length);
-        for(int v=0;v<rest.Length;v++) {
-            Vector2 shift=Vector2.zero;
-            float sum=0;
-            for(int s=0;s<shape.Length;s++) {
-                float w=weights[s];
-                if(w==0 || offset[s][v].sqrMagnitude<1e-18f) continue;
-                if(s==1 || s==2) w=Mathf.Min(w,1-weights[0]);
-                shift+=offset[s][v]*w;
-                sum+=w;
+
+        Array.Clear(frame,0,frame.Length);
+        Array.Clear(totals,0,totals.Length);
+        for(int s=0;s<shape.Length;s++) {
+            float w=applied[s];
+            if(w==0) continue;
+            foreach(int v in affected[s]) {
+                frame[v]+=offset[s][v]*w;
+                totals[v]+=w;
             }
-            frame[v]+=shift/Mathf.Max(1f,sum);
         }
+        for(int v=0;v<rest.Length;v++)
+            frame[v]=totals[v]==0 ? rest[v] : rest[v]+frame[v]/Mathf.Max(1f,totals[v]);
         instance.uv=frame;
         if(!reportedApplication && Array.Exists(weights, w => w>.2f)) {
             int moved=0;
             for(int i=0;i<rest.Length;i++) if((frame[i]-rest[i]).sqrMagnitude>1e-12f) moved++;
-            Debug.Log("[HS2 Eyelid Fix] "+head.name+" moved UV vertices "+moved+"/"+rest.Length);
-            reportedApplication=true;
+            if (moved>0) Debug.Log("[HS2 Eyelid Fix] "+head.name+" moved UV vertices "+moved+"/"+rest.Length);
+            reportedApplication=moved>0;
         }
     }
     float ReadWeight(int slot) { return shape[slot]<0 ? 0f : Mathf.Clamp01(head.GetBlendShapeWeight(shape[slot])*.01f); }
@@ -195,10 +246,3 @@ public sealed class EyelidUV : MonoBehaviour
         if(instance) Destroy(instance);
     }
 }
-
-
-
-
-
-
-
