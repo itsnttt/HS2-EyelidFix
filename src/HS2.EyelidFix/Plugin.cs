@@ -2,12 +2,15 @@ using System;
 using System.Collections.Generic;
 using AIChara;
 using HarmonyLib;
+using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
 using BepInEx;
+using BepInEx.Bootstrap;
 using UnityEngine;
 
 [BepInPlugin("local.hs2.eyelidfix","HS2 Eyelid Fix","1.0.1")]
+[BepInDependency(VanityMeshBinding.Guid,BepInDependency.DependencyFlags.SoftDependency)]
 public sealed class EyelidFix : BaseUnityPlugin
 {
     Harmony hooks;
@@ -16,6 +19,7 @@ public sealed class EyelidFix : BaseUnityPlugin
         hooks = new Harmony("local.hs2.eyelidfix");
         hooks.Patch(AccessTools.Method(typeof(ChaControl), "SetFaceBaseMaterial"),
             postfix: new HarmonyMethod(typeof(EyelidFix), "HeadReady"));
+        VanityMeshBinding.Install(hooks, Logger);
         foreach (var face in FindObjectsOfType<CmpFace>()) AttachFace(face);
     }
     static void HeadReady(ChaControl __instance) { AttachFace(__instance.cmpFace); }
@@ -25,10 +29,96 @@ public sealed class EyelidFix : BaseUnityPlugin
         Attach(face.targetCustom.rendHead);
         Attach(face.targetCustom.rendEyelashes);
     }
-    void OnDestroy() { if (hooks != null) hooks.UnpatchSelf(); }
+    void OnDestroy() {
+        VanityMeshBinding.Uninstall();
+        if (hooks != null) hooks.UnpatchSelf();
+    }
     static void Attach(Renderer renderer) {
             var r = renderer as SkinnedMeshRenderer;
             if(r && !r.GetComponent<EyelidUV>()) r.gameObject.AddComponent<EyelidUV>();
+    }
+}
+
+static class VanityMeshBinding
+{
+    internal const string Guid = "com.freelancer604.makeup";
+    const string prefix = "Freelancer604.MakeUp.HS2.";
+    static readonly ConditionalWeakTable<SkinnedMeshRenderer, Mesh> meshes =
+        new ConditionalWeakTable<SkinnedMeshRenderer, Mesh>();
+    static readonly Action<SkinnedMeshRenderer> beforeBind = BeforeVanityBinds;
+    static EventInfo publicBeforeBind;
+    static Func<SkinnedMeshRenderer, Mesh, bool> publicOwnsMesh;
+
+    internal static void Install(Harmony hooks, BepInEx.Logging.ManualLogSource log)
+    {
+        PluginInfo vanity;
+        if (!Chainloader.PluginInfos.TryGetValue(Guid, out vanity) || !vanity.Instance) return;
+        try {
+            var assembly = vanity.Instance.GetType().Assembly;
+            if (InstallPublic(assembly)) {
+                log.LogInfo("Vanity Studio public mesh handoff enabled.");
+                return;
+            }
+
+            var target = assembly.GetType(prefix + "F604MorphController+ManagedTarget");
+            var pack = assembly.GetType("Freelancer604.Wardrobe.F604ShapePack");
+            var ctor = target == null || pack == null ? null : AccessTools.Constructor(target,
+                new[] { typeof(SkinnedMeshRenderer), pack, typeof(string), typeof(Vector3[]) });
+            if (ctor == null) {
+                log.LogWarning("Vanity Studio mesh handoff was not found.");
+                return;
+            }
+
+            hooks.Patch(ctor, prefix: new HarmonyMethod(typeof(VanityMeshBinding), "BeforeVanityBinds"),
+                postfix: new HarmonyMethod(typeof(VanityMeshBinding), "AfterVanityBinds"));
+            log.LogInfo("Vanity Studio legacy mesh handoff enabled.");
+        } catch (Exception error) {
+            log.LogWarning("Vanity Studio mesh handoff failed: " + error);
+        }
+    }
+
+    static bool InstallPublic(Assembly assembly)
+    {
+        const BindingFlags flags = BindingFlags.Public | BindingFlags.Static;
+        var api = assembly.GetType(prefix + "F604FaceMeshApi");
+        var before = api?.GetEvent("BeforeBind", flags);
+        var owns = api?.GetMethod("OwnsMesh", flags, null,
+            new[] { typeof(SkinnedMeshRenderer), typeof(Mesh) }, null);
+        if (before?.EventHandlerType != beforeBind.GetType() || owns == null) return false;
+        var ownsMesh = (Func<SkinnedMeshRenderer, Mesh, bool>)Delegate.CreateDelegate(
+            typeof(Func<SkinnedMeshRenderer, Mesh, bool>), owns, false);
+        if (ownsMesh == null) return false;
+        before.AddEventHandler(null, beforeBind);
+        publicBeforeBind=before;
+        publicOwnsMesh=ownsMesh;
+        return true;
+    }
+
+    internal static void Uninstall()
+    {
+        publicBeforeBind?.RemoveEventHandler(null, beforeBind);
+        publicBeforeBind=null;
+        publicOwnsMesh=null;
+    }
+
+    internal static bool IsVanityMesh(SkinnedMeshRenderer renderer, Mesh mesh)
+    {
+        if (publicOwnsMesh!=null) return publicOwnsMesh(renderer, mesh);
+        Mesh owned;
+        return meshes.TryGetValue(renderer, out owned) && owned==mesh;
+    }
+
+    static void BeforeVanityBinds(SkinnedMeshRenderer __0)
+    {
+        // Give Vanity the original mesh before it records its restore target.
+        var eyelid = __0.GetComponent<EyelidUV>();
+        if (eyelid) eyelid.PrepareForVanityBind();
+    }
+
+    static void AfterVanityBinds(SkinnedMeshRenderer __0)
+    {
+        meshes.Remove(__0);
+        meshes.Add(__0, __0.sharedMesh);
     }
 }
 
@@ -37,6 +127,7 @@ public sealed class EyelidUV : MonoBehaviour
 {
     SkinnedMeshRenderer head;
     Mesh source, instance;
+    bool ownsInstance;
     Vector2[] rest, frame;
     static readonly string[] names = {
         "e01_close", "e02_close_R", "e03_close_L", "e04_warai", "e04_warai_cl",
@@ -76,9 +167,12 @@ public sealed class EyelidUV : MonoBehaviour
             offset[s]=null; weights[s]=0; applied[s]=0; affected[s]=null;
         }
         frame=new Vector2[rest.Length]; totals=new float[rest.Length];
-        instance=Instantiate(mesh);
-        instance.name=mesh.name;
-        Swap(instance);
+        ownsInstance=!VanityMeshBinding.IsVanityMesh(head, mesh);
+        instance=ownsInstance ? Instantiate(mesh) : mesh;
+        if (ownsInstance) {
+            instance.name=mesh.name;
+            Swap(instance);
+        }
         reportedApplication=false;
     }
     void Swap(Mesh next)
@@ -182,8 +276,7 @@ public sealed class EyelidUV : MonoBehaviour
     {
         var mesh=head.sharedMesh;
         if(instance ? mesh!=instance : mesh!=source) {
-            if(instance) Destroy(instance);
-            instance=null;
+            Release();
             Bind(mesh);
         }
         if(!instance || head.sharedMesh!=instance) return;
@@ -240,9 +333,24 @@ public sealed class EyelidUV : MonoBehaviour
         }
     }
     float ReadWeight(int slot) { return shape[slot]<0 ? 0f : Mathf.Clamp01(head.GetBlendShapeWeight(shape[slot])*.01f); }
-    void OnDestroy()
+    internal void PrepareForVanityBind()
     {
-        if(instance && head && head.sharedMesh==instance && source) Swap(source);
-        if(instance) Destroy(instance);
+        if (instance && head.sharedMesh==instance && (!ownsInstance || source)) Release();
     }
+
+    void Release()
+    {
+        if (instance) {
+            if (ownsInstance) {
+                if (head && head.sharedMesh==instance && source) Swap(source);
+                Destroy(instance);
+            } else {
+                instance.uv=rest;
+            }
+        }
+        instance=source=null;
+        ownsInstance=false;
+    }
+
+    void OnDestroy() { Release(); }
 }
